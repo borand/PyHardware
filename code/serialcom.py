@@ -87,16 +87,8 @@ class SerialRedisCom(object):
     redis_pub_channel = 'data'
     
     def __init__(self,
-                 port = '/dev/ttyUSB0',
-                 packet_timeout=1,
-                 baudrate=115200,       
-                 bytesize=8,    
-                 parity='N',    
-                 stopbits=1, 
-                 xonxoff=0,             
-                 rtscts=0,              
-                 writeTimeout=None,     
-                 dsrdtr=None,
+                 port = '/dev/ttyUSB0',baudrate=115200,       
+                 packet_timeout=1,bytesize=8,parity='N',stopbits=1,xonxoff=0,rtscts=0,writeTimeout=None,dsrdtr=None,
                  host='127.0.0.1',
                  run=True):
         
@@ -105,10 +97,10 @@ class SerialRedisCom(object):
         self.serial    = serial.Serial(port, baudrate, bytesize, parity, stopbits, packet_timeout, xonxoff, rtscts, writeTimeout, dsrdtr)
         self.signature = "{0:s}:{1:s}".format(get_host_ip(), self.serial.port)
         
+        self.redis = redis.Redis(host=host)
         self.redis_send_key = self.signature+'-send'
         self.redis_read_key = self.signature+'-read'
-        self.redis = redis.Redis(host=host)
-        
+                
         logger_name = 'sermon.py:{}'.format(self.signature)
         if sys.stdout.isatty():        
         #    self.log   = Logger(logger_name)
@@ -116,8 +108,8 @@ class SerialRedisCom(object):
             self.log   = logger.RedisLogger(logger_name)
             self.log.addHandler(handlers.RedisHandler.to("log", host='localhost', port=6379))
 
-        self.log.level = 1
-        self.alive = False
+        self.log.level     = 1
+        self.alive         = False
         self._reader_alive = False
 
         # TODO add checking for redis presence and connection
@@ -327,12 +319,12 @@ class SerialRedisCom(object):
                 else:
                     sleep(0.1)
 
-
                 crlf_index = self.buffer.find('\r\n')
 
                 if crlf_index > -1:
                     line = self.buffer[0:crlf_index]
                     temp = self.re_data.findall(line)
+                    self.last_read_line = line   
                     self.log.debug('read line: ' + line)
 
                     if len(temp):
@@ -500,6 +492,7 @@ class SimpleCom(object):
             self.log.error("Exception occured, within the run function: %s" % E.message)
         
         self.log.debug('Exiting run() function')
+        self.last_read_line = output
         return output
 
 ############################################################################################
