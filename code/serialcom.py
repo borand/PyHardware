@@ -83,7 +83,7 @@ class Message(object):
 class SerialRedisCom(object):
     re_data        = re.compile(r'(?:<)(?P<cmd>\d+)(?:>)(.*)(?:<\/)(?P=cmd)(?:>)', re.DOTALL)
     re_next_cmd    = re.compile("(?:<)(\d+)(?:>\{\"cmd\":\")")
-
+    decode_json    = 1
     redis_pub_channel = 'data'
     
     def __init__(self,
@@ -139,7 +139,6 @@ class SerialRedisCom(object):
         if self.redis.sismember('ComPort',self.signature):
             self.redis.srem('ComPort',self.signature)
     
-    # Thread control
     def run(self):
         self.log.debug('run()')
         self._start_reader()
@@ -194,6 +193,7 @@ class SerialRedisCom(object):
         self.log.debug('end of cmd_via_redis_subscriber()')
 
     def stop(self):
+        # 
         self.alive = False
 
     def join(self, transmit_only=False):
@@ -364,6 +364,7 @@ class SerialRedisCom(object):
 
         Msg = Message(self.signature)
         bytes_in_waiting = self.serial.inWaiting()                
+        
         if bytes_in_waiting:
             new_data = self.serial.read(bytes_in_waiting)
             self.buffer = self.buffer + new_data
@@ -396,9 +397,7 @@ class SerialRedisCom(object):
                 Msg.msg = final_data
                 self.log.debug("final_data={}".format(final_data))
                 self.redis.publish(self.redis_pub_channel, Msg.as_jsno())
-                #self.log.debug('.....publish to :' + self.redis_pub_channel)
-                self.redis.set(self.redis_read_key,Msg.as_jsno())                
-                #self.log.debug('.....empty buffer')
+                self.redis.set(self.redis_read_key,Msg.as_jsno())
                 self.buffer = self.buffer[crlf_index+2:]
             else:
                 self.buffer = ''
