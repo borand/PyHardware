@@ -80,20 +80,27 @@ class Message(object):
         return data_dict
 
 ##########################################################################################
+# This class opens connection to a serial port using a reader thread.  The reader thread monitors incomming
+# message on the serial line.  As soon as \n\r is detected the line is read and decoded.  The line read is published to -read redis channel
+#
 class SerialRedisCom(object):
-    re_data        = re.compile(r'(?:<)(?P<cmd>\d+)(?:>)(.*)(?:<\/)(?P=cmd)(?:>)', re.DOTALL)
-    re_next_cmd    = re.compile("(?:<)(\d+)(?:>\{\"cmd\":\")")
-    decode_json    = 1
+    re_data           = re.compile(r'(?:<)(?P<cmd>\d+)(?:>)(.*)(?:<\/)(?P=cmd)(?:>)', re.DOTALL)
+    re_next_cmd       = re.compile("(?:<)(\d+)(?:>\{\"cmd\":\")")
+    decode_json       = True
     redis_pub_channel = 'data'
-    
+    clear_after_error = True
+    next_cmd_num      = -1
+    state             = dict()
+
     def __init__(self,
                  port = '/dev/ttyUSB0',baudrate=115200,       
                  packet_timeout=1,bytesize=8,parity='N',stopbits=1,xonxoff=0,rtscts=0,writeTimeout=None,dsrdtr=None,
                  host='127.0.0.1',
                  run=True):
         
-        self.buffer  = ''
-        self.last_read_line = ''
+        self.buffer         = ''
+        self.last_read_line = ''        
+
         self.serial    = serial.Serial(port, baudrate, bytesize, parity, stopbits, packet_timeout, xonxoff, rtscts, writeTimeout, dsrdtr)
         self.signature = "{0:s}:{1:s}".format(get_host_ip(), self.serial.port)
         
@@ -120,8 +127,14 @@ class SerialRedisCom(object):
         else:
             pass
         
-        if run:
-            self.run()
+        self.last_msg = Message(self.signature)
+
+        self.log.debug('run()')
+        self._start_reader()
+        self._start_listner()
+
+        # if run:
+        #     self.run()
 
     def __del__(self):
         self.log.debug("About to delete the object")
@@ -139,17 +152,19 @@ class SerialRedisCom(object):
         if self.redis.sismember('ComPort',self.signature):
             self.redis.srem('ComPort',self.signature)
     
-    def run(self):
-        self.log.debug('run()')
-        self._start_reader()
-        self._start_listner()
+    # def run(self):
+    #     self.log.debug('run()')
+    #     self._start_reader()
+    #     self._start_listner()
 
     def _start_reader(self):
-        """Start reader thread"""
+        """Start reader thread which monitors serial port for incomming messages.
+        The unsollicided messages are most often the result of hardware interupt on the MCU.
+        """
         self.log.debug("Start serial port reader thread")
         self.alive           = True
         self._reader_alive   = True
-        self.receiver_thread = threading.Thread(target=self.reader)
+        self.receiver_thread = threading.Thread(target=self.read_serial_data_in_a_thread)
         self.receiver_thread.setDaemon(True)
         self.receiver_thread.start()
 
@@ -167,6 +182,10 @@ class SerialRedisCom(object):
         self.redis_subscriber_thread.start()
 
     def cmd_via_redis_subscriber(self):
+        """
+        Subscribes to a redis pub/sub channel and waits for commands to arrive via redis.
+        The commands are forwarded to serial port.  Response is published to the respose channel.
+        """
         self.log.debug('cmd_via_redis_subscriber(channel={})'.format(self.signature))
         self.pubsub    = self.redis.pubsub()
         self.pubsub.subscribe(self.signature)
@@ -195,22 +214,6 @@ class SerialRedisCom(object):
     def stop(self):
         # 
         self.alive = False
-
-    def join(self, transmit_only=False):
-        self.transmitter_thread.join()
-        if not transmit_only:
-            self.receiver_thread.join()
-        
-    def start_thread(self):
-        '''
-        Open the serial serial bus to be read. This starts the listening
-        thread.
-        '''
-
-        self.log.debug('start_thread()')
-        self.serial.flushInput()
-        self.running.set()
-        self.start()
         
     def open(self):
         if not self.serial.isOpen():
@@ -224,6 +227,9 @@ class SerialRedisCom(object):
             return
         self.log.debug("send(cmd=%s)" % data)
         # Automatically append \n by default, but allow the user to send raw characters as well
+        if self.decode_json:
+            self.next_cmd_num = self.re_next_cmd.findall(self.buffer)
+
         if CR:
             if (data[-1] == "\n"):
                 pass            
@@ -301,7 +307,7 @@ class SerialRedisCom(object):
         self._redis_subscriber_alive = False
         self.receiver_thread.join()
 
-    def reader(self):
+    def read_serial_data_in_a_thread(self):
         '''
         Run is the function that runs in the new thread and is called by        
         '''
@@ -311,48 +317,68 @@ class SerialRedisCom(object):
             Msg = Message(self.signature)
 
             while self.alive and self._reader_alive:
+                """
+
+                """
                 bytes_in_waiting = self.serial.inWaiting()
                 
+                self.state['bytes_in_waiting'] = bytes_in_waiting
+                
                 if bytes_in_waiting:
-                    new_data = self.serial.read(bytes_in_waiting)
+                    new_data    = self.serial.read(bytes_in_waiting)
                     self.buffer = self.buffer + new_data
+
+                    self.state['buffer'] = self.buffer 
+                
+                    crlf_index = self.buffer.find('\r\n')
+                    
+                    if crlf_index > -1:
+                        self.log.debug('Found crlf in the buffer')
+                        line = self.buffer[0:crlf_index]                    
+                        self.last_read_line = line   
+                        self.state['line'] = line 
+                        
+                        self.log.debug('read line: ' + line)
+
+                        if self.decode_json:
+                            self.log.debug('decode_json')
+                            temp = self.re_data.findall(line)
+                            self.state['decode_json'] = temp 
+
+                            if len(temp):
+                                final_data = dict()
+                                timestamp = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+                                final_data['timestamp'] = timestamp
+                                final_data['raw']       = line
+                                
+                                try:                                    
+                                    final_data.update({'cmd_number' : temp[0][0]})
+                                    final_data.update({'data' : temp[0][1]})
+                                    self.log.debug('succesfully decoded json data, updated final_data')
+
+                                except Exception as E:
+                                    final_data.update({'cmd_number' : -1})
+                                    final_data.update({'data' : [[]]})
+                                    error_msg = {'timestamp' : timestamp, 'from': self.signature, 'source' : 'ComPort', 'function' : 'def run() - inner', 'error' : E.message}
+                                    Msg.msg = error_msg
+                                    self.log.error(Msg.msg)
+
+                                Msg.msg = final_data
+                                self.state['final_data'] = final_data 
+                                self.last_msg = Msg
+                                self.log.debug("final_data={}".format(final_data))
+                                
+                                self.redis.publish(self.redis_pub_channel, Msg.as_jsno())                        
+                                self.redis.set(self.redis_read_key,Msg.as_jsno())
+                                self.buffer = self.buffer[crlf_index+2:]
+                            else:                                
+                                if self.clear_after_error:
+                                    self.buffer = ''
+                                    self.send('Z')
+                                    self.log.debug('reseting command number')
+                                pass
                 else:
                     sleep(0.1)
-
-                crlf_index = self.buffer.find('\r\n')
-
-                if crlf_index > -1:
-                    line = self.buffer[0:crlf_index]
-                    temp = self.re_data.findall(line)
-                    self.last_read_line = line   
-                    self.log.debug('read line: ' + line)
-
-                    if len(temp):
-                        final_data = dict()
-                        timestamp = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
-                        final_data['timestamp'] = timestamp
-                        final_data['raw']       = line
-                        try:
-                            final_data.update({'cmd_number' : sjson.loads(temp[0][0])})
-                            final_data.update(sjson.loads(temp[0][1]))
-                            self.log.debug('.....updated final_data')
-
-                        except Exception as E:
-                            final_data.update({'cmd_number' : -1})
-                            error_msg = {'timestamp' : timestamp, 'from': self.signature, 'source' : 'ComPort', 'function' : 'def run() - inner', 'error' : E.message}
-                            Msg.msg = error_msg
-                            self.log.error(Msg.msg)
-
-                        Msg.msg = final_data
-                        self.log.debug("final_data={}".format(final_data))
-                        self.redis.publish(self.redis_pub_channel, Msg.as_jsno())                        
-                        self.redis.set(self.redis_read_key,Msg.as_jsno())
-                        self.buffer = self.buffer[crlf_index+2:]                        
-                    else:
-                        self.buffer = ''
-                        self.send('Z')
-                        self.log.debug('.....reseting command number')
-                        pass
 
         except Exception as E:
             error_msg = {'source' : 'ComPort', 'function' : 'def run() - outter', 'error' : E.message}
